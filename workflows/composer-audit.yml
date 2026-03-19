@@ -1,14 +1,15 @@
 # =============================================================================
 # REUSABLE WORKFLOW: Composer Security Audit
 # =============================================================================
-# Location: your central org repo (e.g. fcps-devops/.github)
+# Location: Fayette-County-Public-Schools/.github
 #   at: .github/workflows/composer-audit.yml
 #
 # This workflow is called by individual Laravel app repos. It:
 #   1. Runs `composer audit` to check for known CVEs
 #   2. Parses the JSON output for structured results
 #   3. Opens a GitHub Issue in the calling repo if vulnerabilities are found
-#   4. Closes any existing audit issues if the repo is now clean
+#   4. Opens a PR updating only the vulnerable packages
+#   5. Closes any existing audit issues if the repo is now clean
 # =============================================================================
 
 name: Composer Security Audit (Reusable)
@@ -30,7 +31,7 @@ on:
         default: 'security'
     secrets:
       token:
-        description: 'GitHub token with issues:write permission'
+        description: 'GitHub token with issues:write and pull-requests:write permission'
         required: false # Falls back to GITHUB_TOKEN if not provided
 
 jobs:
@@ -38,13 +39,17 @@ jobs:
     name: Composer Audit
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       issues: write
+      pull-requests: write
 
     steps:
       # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Need full history so we can push a new branch for the fix PR
+          fetch-depth: 0
 
       # -----------------------------------------------------------------------
       - name: Setup PHP ${{ inputs.php-version }}
@@ -65,7 +70,7 @@ jobs:
             composer-${{ runner.os }}-
 
       # -----------------------------------------------------------------------
-      - name: Install dependencies (no scripts, no dev in prod mode)
+      - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
         run: |
           composer install \
@@ -79,8 +84,8 @@ jobs:
         id: audit
         working-directory: ${{ inputs.working-directory }}
         # Exit codes: 0 = clean, 1 = advisories found, 2 = error
-        # We capture output and handle exit code ourselves so the step doesn't
-        # immediately fail before we can process/report results.
+        # Capture output and handle exit code ourselves so we can process
+        # results before deciding whether to fail the job.
         run: |
           set +e
           composer audit --format=json --no-interaction 2>/dev/null > audit-output.json
@@ -96,6 +101,10 @@ jobs:
           echo "advisory_count=$ADVISORY_COUNT" >> $GITHUB_OUTPUT
           echo "abandoned_count=$ABANDONED_COUNT" >> $GITHUB_OUTPUT
 
+          # Extract the list of vulnerable package names for targeted update
+          VULNERABLE_PACKAGES=$(jq -r '.advisories | keys | join(" ")' audit-output.json 2>/dev/null || echo "")
+          echo "vulnerable_packages=$VULNERABLE_PACKAGES" >> $GITHUB_OUTPUT
+
           # Emit a human-readable summary for the Actions log
           echo "## Audit Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Advisories found:** $ADVISORY_COUNT" >> $GITHUB_STEP_SUMMARY
@@ -104,7 +113,8 @@ jobs:
           if [ "$AUDIT_EXIT" -eq 0 ]; then
             echo "✅ No vulnerabilities found." >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️ Vulnerabilities detected. See issue for details." >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Vulnerabilities detected. A fix PR will be opened." >> $GITHUB_STEP_SUMMARY
+            echo "- **Vulnerable packages:** \`$VULNERABLE_PACKAGES\`" >> $GITHUB_STEP_SUMMARY
           fi
 
       # -----------------------------------------------------------------------
@@ -128,7 +138,8 @@ jobs:
               "",
               f"**Branch/Ref:** `{ref}`  ",
               f"**Workflow Run:** [{run_url}]({run_url})  ",
-              f"**Detected:** {os.environ['GITHUB_RUN_STARTED_AT'] if 'GITHUB_RUN_STARTED_AT' in os.environ else 'see run link'}",
+              "",
+              "> A pull request has been automatically opened to update the vulnerable packages.",
               "",
           ]
 
@@ -143,9 +154,9 @@ jobs:
                       advisory_list = [pkg_advisories]
 
                   for adv in advisory_list:
-                      cve     = adv.get("cve", "N/A")
-                      title   = adv.get("title", "No title")
-                      link    = adv.get("link", "")
+                      cve      = adv.get("cve", "N/A")
+                      title    = adv.get("title", "No title")
+                      link     = adv.get("link", "")
                       affected = adv.get("affectedVersions", "unknown")
                       reported = adv.get("reportedAt", "")
 
@@ -174,18 +185,6 @@ jobs:
 
           lines += [
               "---",
-              "### Remediation Steps",
-              "```bash",
-              "# Update all packages",
-              "composer update",
-              "",
-              "# Or update a specific package",
-              "composer update vendor/package",
-              "",
-              "# Re-run audit after updating",
-              "composer audit",
-              "```",
-              "",
               "> This issue was automatically created by the Composer Audit workflow.",
               "> It will be closed automatically when the audit passes.",
           ]
@@ -194,12 +193,12 @@ jobs:
           PYEOF
           )
 
-          # Write to a file to avoid shell escaping issues with multiline
           echo "$BODY" > issue-body.md
           echo "body_file=issue-body.md" >> $GITHUB_OUTPUT
 
       # -----------------------------------------------------------------------
       - name: Create or update GitHub Issue
+        id: upsert-issue
         if: steps.audit.outputs.exit_code != '0'
         uses: actions/github-script@v7
         with:
@@ -236,22 +235,23 @@ jobs:
             });
 
             const existing = issues.find(i => i.title === title);
+            let issueNumber;
 
             if (existing) {
-              // Update existing issue with fresh audit results
               await github.rest.issues.update({
-                owner:    context.repo.owner,
-                repo:     context.repo.repo,
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
                 issue_number: existing.number,
-                body:     body,
+                body:         body,
               });
               await github.rest.issues.createComment({
                 owner:        context.repo.owner,
                 repo:         context.repo.repo,
                 issue_number: existing.number,
-                body:         `🔄 Audit re-run on \`${context.ref}\` — vulnerabilities still present. Issue body updated with latest results.`,
+                body:         `🔄 Audit re-run on \`${context.ref}\` — vulnerabilities still present. A fix PR has been opened or updated.`,
               });
-              console.log(`Updated existing issue #${existing.number}`);
+              issueNumber = existing.number;
+              console.log(`Updated existing issue #${issueNumber}`);
             } else {
               const { data: newIssue } = await github.rest.issues.create({
                 owner:  context.repo.owner,
@@ -260,7 +260,146 @@ jobs:
                 body:   body,
                 labels: [label],
               });
-              console.log(`Created issue #${newIssue.number}`);
+              issueNumber = newIssue.number;
+              console.log(`Created issue #${issueNumber}`);
+            }
+
+            core.setOutput('issue_number', issueNumber);
+
+      # -----------------------------------------------------------------------
+      - name: Update vulnerable packages and open fix PR
+        if: steps.audit.outputs.exit_code != '0'
+        uses: actions/github-script@v7
+        env:
+          VULNERABLE_PACKAGES: ${{ steps.audit.outputs.vulnerable_packages }}
+          ISSUE_NUMBER: ${{ steps.upsert-issue.outputs.issue_number }}
+          WORKING_DIR: ${{ inputs.working-directory }}
+          ISSUE_LABEL: ${{ inputs.issue-label }}
+        with:
+          github-token: ${{ secrets.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+            const packages     = process.env.VULNERABLE_PACKAGES.trim();
+            const issueNumber  = process.env.ISSUE_NUMBER;
+            const workingDir   = process.env.WORKING_DIR;
+            const label        = process.env.ISSUE_LABEL;
+            const repo         = context.repo;
+            const branchName   = 'fix/composer-security-audit';
+            const prTitle      = '🔐 fix: update vulnerable Composer packages';
+
+            if (!packages) {
+              console.log('No vulnerable packages identified — skipping PR.');
+              return;
+            }
+
+            // Configure git identity for the commit
+            execSync('git config user.name "github-actions[bot]"');
+            execSync('git config user.email "github-actions[bot]@users.noreply.github.com"');
+
+            // Check if fix branch already exists remotely
+            let branchExists = false;
+            try {
+              execSync(`git ls-remote --exit-code origin refs/heads/${branchName}`);
+              branchExists = true;
+            } catch { /* branch does not exist yet */ }
+
+            if (branchExists) {
+              execSync(`git fetch origin ${branchName}`);
+              execSync(`git checkout ${branchName}`);
+            } else {
+              execSync(`git checkout -b ${branchName}`);
+            }
+
+            // Run targeted composer update on only the vulnerable packages
+            const updateCmd = `composer update ${packages} --no-interaction --no-scripts --prefer-dist`;
+            console.log(`Running: ${updateCmd}`);
+            try {
+              execSync(updateCmd, { cwd: workingDir, stdio: 'inherit' });
+            } catch (err) {
+              console.error('composer update failed:', err.message);
+              core.setFailed('composer update failed — check the workflow log for details.');
+              return;
+            }
+
+            // Check if composer.lock actually changed
+            const diff = execSync('git diff --name-only').toString().trim();
+            if (!diff.includes('composer.lock') && !diff.includes('composer.json')) {
+              console.log('No changes to composer.lock after update — packages may already be at latest allowed versions.');
+              await github.rest.issues.createComment({
+                owner:        repo.owner,
+                repo:         repo.repo,
+                issue_number: issueNumber,
+                body:         '⚠️ Attempted `composer update` on vulnerable packages but `composer.lock` did not change. The vulnerabilities may require a manual version constraint update in `composer.json`.',
+              });
+              return;
+            }
+
+            // Commit the updated lock file
+            execSync(`git add ${workingDir}/composer.lock ${workingDir}/composer.json || true`);
+            execSync(`git commit -m "fix: update vulnerable Composer packages\n\nPackages updated: ${packages}\n\nResolves #${issueNumber}"`);
+            execSync(`git push origin ${branchName} --force-with-lease`);
+
+            // Build PR body
+            const prBody = [
+              `## 🔐 Composer Security Fix`,
+              ``,
+              `This PR was automatically generated by the Composer Audit workflow.`,
+              `It updates only the packages flagged with security advisories.`,
+              ``,
+              `**Packages updated:** \`${packages.split(' ').join('`, `')}\``,
+              ``,
+              `Closes #${issueNumber}`,
+              ``,
+              `---`,
+              `**Review checklist before merging:**`,
+              `- [ ] Confirm \`composer audit\` passes on this branch`,
+              `- [ ] Verify tests pass`,
+              `- [ ] Check for any breaking changes in the updated package changelogs`,
+            ].join('\n');
+
+            // Check if a PR for this branch already exists
+            const { data: existingPRs } = await github.rest.pulls.list({
+              owner: repo.owner,
+              repo:  repo.repo,
+              state: 'open',
+              head:  `${repo.owner}:${branchName}`,
+            });
+
+            if (existingPRs.length > 0) {
+              await github.rest.pulls.update({
+                owner:        repo.owner,
+                repo:         repo.repo,
+                pull_number:  existingPRs[0].number,
+                body:         prBody,
+              });
+              console.log(`Updated existing PR #${existingPRs[0].number}`);
+            } else {
+              const { data: pr } = await github.rest.pulls.create({
+                owner: repo.owner,
+                repo:  repo.repo,
+                title: prTitle,
+                body:  prBody,
+                head:  branchName,
+                base:  'main',
+              });
+
+              // Apply the security label to the PR
+              await github.rest.issues.addLabels({
+                owner:        repo.owner,
+                repo:         repo.repo,
+                issue_number: pr.number,
+                labels:       [label],
+              });
+
+              // Link the PR back to the issue as a comment
+              await github.rest.issues.createComment({
+                owner:        repo.owner,
+                repo:         repo.repo,
+                issue_number: issueNumber,
+                body:         `🔧 Fix PR opened: #${pr.number}`,
+              });
+
+              console.log(`Opened PR #${pr.number}`);
             }
 
       # -----------------------------------------------------------------------
