@@ -1,0 +1,308 @@
+# =============================================================================
+# REUSABLE WORKFLOW: Composer Security Audit
+# =============================================================================
+# Location: your central org repo (e.g. fcps-devops/.github)
+#   at: .github/workflows/composer-audit.yml
+#
+# This workflow is called by individual Laravel app repos. It:
+#   1. Runs `composer audit` to check for known CVEs
+#   2. Parses the JSON output for structured results
+#   3. Opens a GitHub Issue in the calling repo if vulnerabilities are found
+#   4. Closes any existing audit issues if the repo is now clean
+# =============================================================================
+
+name: Composer Security Audit (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      php-version:
+        description: 'PHP version to use'
+        type: string
+        default: '8.4'
+      working-directory:
+        description: 'Directory containing composer.json (relative to repo root)'
+        type: string
+        default: '.'
+      issue-label:
+        description: 'Label to apply to opened vulnerability issues'
+        type: string
+        default: 'security'
+    secrets:
+      token:
+        description: 'GitHub token with issues:write permission'
+        required: false # Falls back to GITHUB_TOKEN if not provided
+
+jobs:
+  composer-audit:
+    name: Composer Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: Setup PHP ${{ inputs.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          tools: composer:v2
+          coverage: none
+
+      # -----------------------------------------------------------------------
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ runner.os }}-${{ inputs.php-version }}-${{ hashFiles(format('{0}/composer.lock', inputs.working-directory)) }}
+          restore-keys: |
+            composer-${{ runner.os }}-${{ inputs.php-version }}-
+            composer-${{ runner.os }}-
+
+      # -----------------------------------------------------------------------
+      - name: Install dependencies (no scripts, no dev in prod mode)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          composer install \
+            --no-interaction \
+            --no-scripts \
+            --prefer-dist \
+            --optimize-autoloader
+
+      # -----------------------------------------------------------------------
+      - name: Run composer audit
+        id: audit
+        working-directory: ${{ inputs.working-directory }}
+        # Exit codes: 0 = clean, 1 = advisories found, 2 = error
+        # We capture output and handle exit code ourselves so the step doesn't
+        # immediately fail before we can process/report results.
+        run: |
+          set +e
+          composer audit --format=json --no-interaction 2>/dev/null > audit-output.json
+          AUDIT_EXIT=$?
+          set -e
+
+          echo "exit_code=$AUDIT_EXIT" >> $GITHUB_OUTPUT
+
+          # Parse counts from JSON
+          ADVISORY_COUNT=$(jq '.advisories | length' audit-output.json 2>/dev/null || echo "0")
+          ABANDONED_COUNT=$(jq '.abandoned | length' audit-output.json 2>/dev/null || echo "0")
+
+          echo "advisory_count=$ADVISORY_COUNT" >> $GITHUB_OUTPUT
+          echo "abandoned_count=$ABANDONED_COUNT" >> $GITHUB_OUTPUT
+
+          # Emit a human-readable summary for the Actions log
+          echo "## Audit Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Advisories found:** $ADVISORY_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- **Abandoned packages:** $ABANDONED_COUNT" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$AUDIT_EXIT" -eq 0 ]; then
+            echo "✅ No vulnerabilities found." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Vulnerabilities detected. See issue for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: Build issue body
+        id: issue-body
+        if: steps.audit.outputs.exit_code != '0'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          BODY=$(python3 << 'PYEOF'
+          import json, sys, os
+
+          with open("audit-output.json") as f:
+              data = json.load(f)
+
+          repo    = os.environ["GITHUB_REPOSITORY"]
+          run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          ref     = os.environ["GITHUB_REF_NAME"]
+
+          lines = [
+              "## 🔐 Composer Security Audit: Vulnerabilities Found",
+              "",
+              f"**Branch/Ref:** `{ref}`  ",
+              f"**Workflow Run:** [{run_url}]({run_url})  ",
+              f"**Detected:** {os.environ['GITHUB_RUN_STARTED_AT'] if 'GITHUB_RUN_STARTED_AT' in os.environ else 'see run link'}",
+              "",
+          ]
+
+          advisories = data.get("advisories", {})
+          if advisories:
+              lines.append("### 🚨 Security Advisories")
+              lines.append("")
+              for package, pkg_advisories in advisories.items():
+                  if isinstance(pkg_advisories, list):
+                      advisory_list = pkg_advisories
+                  else:
+                      advisory_list = [pkg_advisories]
+
+                  for adv in advisory_list:
+                      cve     = adv.get("cve", "N/A")
+                      title   = adv.get("title", "No title")
+                      link    = adv.get("link", "")
+                      affected = adv.get("affectedVersions", "unknown")
+                      reported = adv.get("reportedAt", "")
+
+                      lines.append(f"#### `{package}`")
+                      lines.append(f"- **CVE:** {cve}")
+                      lines.append(f"- **Title:** {title}")
+                      lines.append(f"- **Affected versions:** `{affected}`")
+                      if reported:
+                          lines.append(f"- **Reported:** {reported}")
+                      if link:
+                          lines.append(f"- **Advisory:** [{link}]({link})")
+                      lines.append("")
+
+          abandoned = data.get("abandoned", {})
+          if abandoned:
+              lines.append("### ⚠️ Abandoned Packages")
+              lines.append("")
+              lines.append("These packages are no longer maintained and may pose a long-term risk:")
+              lines.append("")
+              for package, replacement in abandoned.items():
+                  if replacement:
+                      lines.append(f"- `{package}` → consider replacing with `{replacement}`")
+                  else:
+                      lines.append(f"- `{package}` (no suggested replacement)")
+              lines.append("")
+
+          lines += [
+              "---",
+              "### Remediation Steps",
+              "```bash",
+              "# Update all packages",
+              "composer update",
+              "",
+              "# Or update a specific package",
+              "composer update vendor/package",
+              "",
+              "# Re-run audit after updating",
+              "composer audit",
+              "```",
+              "",
+              "> This issue was automatically created by the Composer Audit workflow.",
+              "> It will be closed automatically when the audit passes.",
+          ]
+
+          print("\n".join(lines))
+          PYEOF
+          )
+
+          # Write to a file to avoid shell escaping issues with multiline
+          echo "$BODY" > issue-body.md
+          echo "body_file=issue-body.md" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      - name: Create or update GitHub Issue
+        if: steps.audit.outputs.exit_code != '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs    = require('fs');
+            const label = '${{ inputs.issue-label }}';
+            const title = '🔐 Composer Security Audit: Vulnerabilities Detected';
+            const body  = fs.readFileSync('${{ inputs.working-directory }}/issue-body.md', 'utf8');
+
+            // Ensure the label exists
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                name:  label,
+              });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                name:        label,
+                color:       'd73a4a',
+                description: 'Security vulnerability',
+              });
+            }
+
+            // Check for an existing open audit issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              state:  'open',
+              labels: label,
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              // Update existing issue with fresh audit results
+              await github.rest.issues.update({
+                owner:    context.repo.owner,
+                repo:     context.repo.repo,
+                issue_number: existing.number,
+                body:     body,
+              });
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: existing.number,
+                body:         `🔄 Audit re-run on \`${context.ref}\` — vulnerabilities still present. Issue body updated with latest results.`,
+              });
+              console.log(`Updated existing issue #${existing.number}`);
+            } else {
+              const { data: newIssue } = await github.rest.issues.create({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                title:  title,
+                body:   body,
+                labels: [label],
+              });
+              console.log(`Created issue #${newIssue.number}`);
+            }
+
+      # -----------------------------------------------------------------------
+      - name: Close audit issue if repo is clean
+        if: steps.audit.outputs.exit_code == '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const label = '${{ inputs.issue-label }}';
+            const title = '🔐 Composer Security Audit: Vulnerabilities Detected';
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              state:  'open',
+              labels: label,
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: existing.number,
+                body:         '✅ Composer audit is now clean. Closing this issue automatically.',
+              });
+              await github.rest.issues.update({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: existing.number,
+                state:        'closed',
+              });
+              console.log(`Closed issue #${existing.number} — audit is clean.`);
+            } else {
+              console.log('No open audit issue found. Nothing to close.');
+            }
+
+      # -----------------------------------------------------------------------
+      - name: Fail job if vulnerabilities found
+        if: steps.audit.outputs.exit_code != '0'
+        run: |
+          echo "::error::Composer audit found ${{ steps.audit.outputs.advisory_count }} advisory/advisories and ${{ steps.audit.outputs.abandoned_count }} abandoned package(s)."
+          exit 1
