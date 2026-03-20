@@ -70,6 +70,9 @@ jobs:
             composer-${{ runner.os }}-
 
       # -----------------------------------------------------------------------
+      - name: Configure Flux Pro credentials
+        run: composer config http-basic.composer.fluxui.dev ${{ secrets.FLUX_EMAIL }} ${{ secrets.FLUX_SECRET }}
+
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
         run: |
