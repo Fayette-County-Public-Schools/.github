@@ -305,10 +305,10 @@ jobs:
               execSync(`git ls-remote --exit-code origin refs/heads/${branchName}`);
               branchExists = true;
             } catch { /* branch does not exist yet */ }
-
+           
             if (branchExists) {
               execSync(`git fetch origin ${branchName}`);
-              execSync(`git checkout ${branchName}`);
+              execSync(`git checkout -B ${branchName} origin/${defaultBranch}`);
             } else {
               execSync(`git checkout -b ${branchName}`);
             }
