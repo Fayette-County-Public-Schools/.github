@@ -368,6 +368,12 @@ jobs:
               head:  `${repo.owner}:${branchName}`,
             });
 
+            const { data: repoData } = await github.rest.repos.get({
+              owner: repo.owner,
+              repo:  repo.repo,
+            });
+            const defaultBranch = repoData.default_branch;
+
             if (existingPRs.length > 0) {
               await github.rest.pulls.update({
                 owner:        repo.owner,
@@ -383,7 +389,7 @@ jobs:
                 title: prTitle,
                 body:  prBody,
                 head:  branchName,
-                base:  'main',
+                base:  defaultBranch,
               });
 
               // Apply the security label to the PR
