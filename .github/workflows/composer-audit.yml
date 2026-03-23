@@ -305,6 +305,12 @@ jobs:
               execSync(`git ls-remote --exit-code origin refs/heads/${branchName}`);
               branchExists = true;
             } catch { /* branch does not exist yet */ }
+
+             const { data: repoData } = await github.rest.repos.get({
+              owner: repo.owner,
+              repo:  repo.repo,
+            });
+            const defaultBranch = repoData.default_branch;
            
             if (branchExists) {
               execSync(`git fetch origin ${branchName}`);
@@ -367,12 +373,6 @@ jobs:
               state: 'open',
               head:  `${repo.owner}:${branchName}`,
             });
-
-            const { data: repoData } = await github.rest.repos.get({
-              owner: repo.owner,
-              repo:  repo.repo,
-            });
-            const defaultBranch = repoData.default_branch;
 
             if (existingPRs.length > 0) {
               await github.rest.pulls.update({
